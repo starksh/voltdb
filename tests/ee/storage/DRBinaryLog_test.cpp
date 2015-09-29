@@ -99,9 +99,9 @@ public:
         const vector<string> columnNames(columnNamesArray, columnNamesArray + COLUMN_COUNT);
 
         m_table = reinterpret_cast<PersistentTable*>(voltdb::TableFactory::getPersistentTable(0, "P_TABLE", m_schema, columnNames, tableHandle, false, 0));
-        m_tableReplica = reinterpret_cast<PersistentTable*>(voltdb::TableFactory::getPersistentTable(0, "P_TABLE", m_schemaReplica, columnNames, tableHandle, false, 0));
+        m_tableReplica = reinterpret_cast<PersistentTable*>(voltdb::TableFactory::getPersistentTable(0, "P_TABLE_REPLICA", m_schemaReplica, columnNames, tableHandle, false, 0));
         m_replicatedTable = reinterpret_cast<PersistentTable*>(voltdb::TableFactory::getPersistentTable(0, "R_TABLE", m_replicatedSchema, columnNames, replicatedTableHandle, false, -1));
-        m_replicatedTableReplica = reinterpret_cast<PersistentTable*>(voltdb::TableFactory::getPersistentTable(0, "R_TABLE", m_replicatedSchemaReplica, columnNames, replicatedTableHandle, false, -1));
+        m_replicatedTableReplica = reinterpret_cast<PersistentTable*>(voltdb::TableFactory::getPersistentTable(0, "R_TABLE_REPLICA", m_replicatedSchemaReplica, columnNames, replicatedTableHandle, false, -1));
 
         m_table->setDR(true);
         m_tableReplica->setDR(true);
@@ -239,7 +239,15 @@ public:
         return m_topend.receivedDRBuffer;
     }
 
-    void flushAndApply(int64_t lastCommittedSpHandle, bool success = true) {
+    void flushButDontApply(int64_t lastCommittedSpHandle) {
+        flush(lastCommittedSpHandle);
+        for (int i = static_cast<int>(m_topend.blocks.size()); i > 0; i--) {
+            m_topend.blocks.pop_back();
+            m_topend.data.pop_back();
+        }
+    }
+
+    void flushAndApply(int64_t lastCommittedSpHandle, bool success = true, bool isActiveActiveDREnabled = false) {
         ASSERT_TRUE(flush(lastCommittedSpHandle));
 
         m_context->setupForPlanFragments(m_undoLog.generateUndoQuantum(m_undoToken));
@@ -259,7 +267,7 @@ public:
             *reinterpret_cast<int32_t*>(&data.get()[startPos]) = htonl(static_cast<int32_t>(sb->offset()));
             m_drStream.m_enabled = false;
             m_drReplicatedStream.m_enabled = false;
-            m_sink.apply(&data[startPos], tables, &m_pool, NULL);
+            m_sink.apply(&data[startPos], tables, &m_pool, NULL, isActiveActiveDREnabled);
             m_drStream.m_enabled = true;
             m_drReplicatedStream.m_enabled = true;
         }
@@ -307,17 +315,17 @@ public:
         m_table->addIndex(thirdIndex);
     }
 
-    void createPrimaryKey() {
+    void createPrimaryKey(Table* table, int indexColumn) {
         vector<int> columnIndices;
-        columnIndices.push_back(1); // BIGINT
+        columnIndices.push_back(indexColumn); // BIGINT
         TableIndexScheme scheme = TableIndexScheme("primaryKeyIndex", BALANCED_TREE_INDEX,
                                                     columnIndices,
                                                     TableIndex::simplyIndexColumns(),
-                                                    true, true, m_schema);
+                                                    true, true, table->schema());
         TableIndex *pkeyIndex = TableIndexFactory::TableIndexFactory::getInstance(scheme);
         assert(pkeyIndex);
-        m_table->addIndex(pkeyIndex);
-        m_table->setPrimaryKeyIndex(pkeyIndex);
+        table->addIndex(pkeyIndex);
+        table->setPrimaryKeyIndex(pkeyIndex);
     }
 
     void simpleDeleteTest() {
@@ -428,398 +436,488 @@ protected:
     vector<NValue> m_cachedStringValues;//To free at the end of the test
 };
 
-TEST_F(DRBinaryLogTest, VerifyHiddenColumns) {
-    ASSERT_FALSE(flush(98));
-
-    // single row write transaction
-    beginTxn(99, 99, 98, 70);
-    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
-    endTxn(true);
-
-    flushAndApply(99);
-
-    TableTuple tuple = m_tableReplica->lookupTupleByValues(first_tuple);
-    NValue drTimestamp = tuple.getHiddenNValue(m_table->getDRTimestampColumnIndex());
-    NValue drTimestampReplica = tuple.getHiddenNValue(m_tableReplica->getDRTimestampColumnIndex());
-    EXPECT_EQ(ValuePeeker::peekAsBigInt(drTimestamp), 70);
-    EXPECT_EQ(0, drTimestamp.compare(drTimestampReplica));
-}
-
-TEST_F(DRBinaryLogTest, PartitionedTableNoRollbacks) {
-    ASSERT_FALSE(flush(98));
-
-    // single row write transaction
-    beginTxn(99, 99, 98, 70);
-    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
-    endTxn(true);
-
-    // single row write transaction
-    beginTxn(100, 100, 99, 71);
-    TableTuple second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
-    endTxn(true);
-
-    flushAndApply(100);
-
-    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
-    TableTuple tuple = m_tableReplica->lookupTupleByValues(first_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-    tuple = m_tableReplica->lookupTupleByValues(second_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-
-    // multiple row, multipart write transaction
-    beginTxn(111, 101, 100, 72);
-    first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
-
-    // Tick during an ongoing txn -- should not push out a buffer
-    ASSERT_FALSE(flush(100));
-
-    second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 7, 234, "23452436.54", "what", "this is starting to get silly", 2342));
-    endTxn(true);
-
-    // delete the second row inserted in the last write
-    beginTxn(112, 102, 101, 73);
-    deleteTuple(m_table, second_tuple);
-    // Tick before the delete
-    ASSERT_TRUE(flush(101));
-    endTxn(true);
-    // Apply the binary log after endTxn() to get a valid undoToken.
-    flushAndApply(101);
-
-    EXPECT_EQ(4, m_tableReplica->activeTupleCount());
-    tuple = m_tableReplica->lookupTupleByValues(first_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-    tuple = m_tableReplica->lookupTupleByValues(prepareTempTuple(m_table, 7, 234, "23452436.54", "what", "this is starting to get silly", 2342));
-    ASSERT_FALSE(tuple.isNullTuple());
-
-    // Propagate the delete
-    flushAndApply(102);
-    EXPECT_EQ(3, m_tableReplica->activeTupleCount());
-    tuple = m_tableReplica->lookupTupleByValues(first_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-    tuple = m_tableReplica->lookupTupleByValues(second_tuple);
-    ASSERT_TRUE(tuple.isNullTuple());
-
-    EXPECT_EQ(3, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
-    EXPECT_EQ(-1, m_drReplicatedStream.getLastCommittedSequenceNumberAndUniqueId().first);
-}
-
-TEST_F(DRBinaryLogTest, PartitionedTableRollbacks) {
-    m_singleColumnTable->setDR(false);
-
-    beginTxn(99, 99, 98, 70);
-    TableTuple source_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
-    endTxn(false);
-
-    // Intentionally ignore the fact that a rollback wouldn't have actually advanced the
-    // lastCommittedSpHandle. Our goal is to tick such that, if data had been produced,
-    // it would flush itself out now
-    ASSERT_FALSE(flush(99));
-
-    EXPECT_EQ(-1, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
-    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
-
-    beginTxn(100, 100, 99, 71);
-    source_tuple = insertTuple(m_table, prepareTempTuple(m_table, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
-    endTxn(true);
-
-    // Roll back a txn that hasn't applied any binary log data
-    beginTxn(101, 101, 100, 72);
-    TableTuple temp_tuple = m_singleColumnTable->tempTuple();
-    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(1));
-    insertTuple(m_singleColumnTable, temp_tuple);
-    endTxn(false);
-
-    flushAndApply(101);
-
-    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
-    TableTuple tuple = m_tableReplica->lookupTupleByValues(source_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-
-    EXPECT_EQ(0, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
-}
-
-TEST_F(DRBinaryLogTest, ReplicatedTableWrites) {
-    // write to only the replicated table
-    beginTxn(109, 99, 98, 70);
-    TableTuple first_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
-    endTxn(true);
-
-    flushAndApply(99);
-
-    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
-    EXPECT_EQ(1, m_replicatedTableReplica->activeTupleCount());
-    TableTuple tuple = m_replicatedTableReplica->lookupTupleByValues(first_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-
-    // write to both the partitioned and replicated table
-    beginTxn(110, 100, 99, 71);
-    first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
-    TableTuple second_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 7, 234, "23452436.54", "what", "this is starting to get silly", 2342));
-    endTxn(true);
-
-    flushAndApply(100);
-
-    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
-    EXPECT_EQ(2, m_replicatedTableReplica->activeTupleCount());
-    tuple = m_tableReplica->lookupTupleByValues(first_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-    tuple = m_replicatedTableReplica->lookupTupleByValues(second_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-
-    // write to the partitioned and replicated table and roll it back
-    beginTxn(111, 101, 100, 72);
-    first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 11, 34534, "3453.4545", "another", "blah blah blah blah blah blah", 2344));
-    second_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
-    endTxn(false);
-
-    ASSERT_FALSE(flush(101));
-
-    // one more write to the replicated table for good measure
-    beginTxn(112, 102, 101, 73);
-    second_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
-    endTxn(true);
-
-    flushAndApply(102);
-    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
-    EXPECT_EQ(3, m_replicatedTableReplica->activeTupleCount());
-    tuple = m_replicatedTableReplica->lookupTupleByValues(second_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-
-    EXPECT_EQ(0, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
-    EXPECT_EQ(2, m_drReplicatedStream.getLastCommittedSequenceNumberAndUniqueId().first);
-}
-
-TEST_F(DRBinaryLogTest, SerializeNulls) {
-    beginTxn(109, 99, 98, 70);
-    TableTuple temp_tuple = m_replicatedTable->tempTuple();
-    temp_tuple.setNValue(0, NValue::getNullValue(VALUE_TYPE_TINYINT));
-    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(489735));
-    temp_tuple.setNValue(2, NValue::getNullValue(VALUE_TYPE_DECIMAL));
-    m_cachedStringValues.push_back(ValueFactory::getStringValue("whatever"));
-    temp_tuple.setNValue(3, m_cachedStringValues.back());
-    temp_tuple.setNValue(4, ValueFactory::getNullStringValue());
-    temp_tuple.setNValue(5, ValueFactory::getTimestampValue(3495));
-    TableTuple first_tuple = insertTuple(m_replicatedTable, temp_tuple);
-
-    temp_tuple = m_replicatedTable->tempTuple();
-    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(42));
-    temp_tuple.setNValue(1, NValue::getNullValue(VALUE_TYPE_BIGINT));
-    temp_tuple.setNValue(2, ValueFactory::getDecimalValueFromString("234234.243"));
-    temp_tuple.setNValue(3, ValueFactory::getNullStringValue());
-    m_cachedStringValues.push_back(ValueFactory::getStringValue("whatever and ever and ever and ever"));
-    temp_tuple.setNValue(4, m_cachedStringValues.back());
-    temp_tuple.setNValue(5, NValue::getNullValue(VALUE_TYPE_TIMESTAMP));
-    TableTuple second_tuple = insertTuple(m_replicatedTable, temp_tuple);
-    endTxn(true);
-
-    flushAndApply(99);
-
-    EXPECT_EQ(2, m_replicatedTableReplica->activeTupleCount());
-    TableTuple tuple = m_replicatedTableReplica->lookupTupleByValues(first_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-    tuple = m_replicatedTableReplica->lookupTupleByValues(second_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-}
-
-TEST_F(DRBinaryLogTest, RollbackNulls) {
-    beginTxn(109, 99, 98, 70);
-    TableTuple temp_tuple = m_replicatedTable->tempTuple();
-    temp_tuple.setNValue(0, NValue::getNullValue(VALUE_TYPE_TINYINT));
-    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(489735));
-    temp_tuple.setNValue(2, NValue::getNullValue(VALUE_TYPE_DECIMAL));
-    m_cachedStringValues.push_back(ValueFactory::getStringValue("whatever"));
-    temp_tuple.setNValue(3, m_cachedStringValues.back());
-    temp_tuple.setNValue(4, ValueFactory::getNullStringValue());
-    temp_tuple.setNValue(5, ValueFactory::getTimestampValue(3495));
-    insertTuple(m_replicatedTable, temp_tuple);
-    endTxn(false);
-
-    beginTxn(110, 100, 99, 71);
-    TableTuple source_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
-    endTxn(true);
-
-    flushAndApply(100);
-
-    EXPECT_EQ(1, m_replicatedTableReplica->activeTupleCount());
-    TableTuple tuple = m_replicatedTableReplica->lookupTupleByValues(source_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-}
-
-TEST_F(DRBinaryLogTest, RollbackOnReplica) {
-    // single row write transaction
-    beginTxn(99, 99, 98, 70);
-    insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
-    endTxn(true);
-
-    // try and fail to apply this on the replica
-    flushAndApply(99, false);
-
-    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
-
-    // successfully apply some data for, I don't know, verisimilitude?
-    beginTxn(100, 100, 99, 71);
-    TableTuple source_tuple = insertTuple(m_table, prepareTempTuple(m_table, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
-    endTxn(true);
-
-    flushAndApply(100);
-
-    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
-    TableTuple tuple = m_tableReplica->lookupTupleByValues(source_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-
-    // inserts followed by some deletes
-    beginTxn(101, 101, 100, 72);
-    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 11, 34534, "3453.4545", "another", "blah blah blah blah blah blah", 2344));
-    TableTuple second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
-    insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
-    deleteTuple(m_table, first_tuple);
-    deleteTuple(m_table, second_tuple);
-    endTxn(true);
-
-    flushAndApply(101, false);
-
-    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
-    tuple = m_tableReplica->lookupTupleByValues(source_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-}
-
-TEST_F(DRBinaryLogTest, CantFindTable) {
-    beginTxn(99, 99, 98, 70);
-    TableTuple temp_tuple = m_singleColumnTable->tempTuple();
-    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(1));
-    insertTuple(m_singleColumnTable, temp_tuple);
-    endTxn(true);
-
-    // try and fail to apply this on the replica because the table cannot be found.
-    // should not throw fatal exception.
-    try {
-        flushAndApply(99, false);
-    } catch (SerializableEEException &e) {
-        endTxn(false);
-    } catch (...) {
-        ASSERT_TRUE(false);
-    }
-}
-
-TEST_F(DRBinaryLogTest, DeleteWithUniqueIndex) {
-    createIndexes();
-    simpleDeleteTest();
-}
-
-TEST_F(DRBinaryLogTest, DeleteWithUniqueIndexMultipleTables) {
-    createIndexes();
-
-    std::pair<const TableIndex*, uint32_t> indexPair1 = m_otherTableWithIndex->getSmallestUniqueIndex();
-    std::pair<const TableIndex*, uint32_t> indexPair2 = m_otherTableWithoutIndex->getSmallestUniqueIndex();
-    ASSERT_FALSE(indexPair1.first == NULL);
-    ASSERT_TRUE(indexPair2.first == NULL);
-
-    beginTxn(99, 99, 98, 70);
-    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
-    TableTuple second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
-    TableTuple temp_tuple = m_otherTableWithIndex->tempTuple();
-    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(0));
-    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(1));
-    TableTuple third_tuple = insertTuple(m_otherTableWithIndex, temp_tuple);
-    temp_tuple = m_otherTableWithoutIndex->tempTuple();
-    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(2));
-    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(3));
-    TableTuple fourth_tuple = insertTuple(m_otherTableWithoutIndex, temp_tuple);
-    endTxn(true);
-
-    flushAndApply(99);
-
-    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
-    EXPECT_EQ(1, m_otherTableWithIndexReplica->activeTupleCount());
-    EXPECT_EQ(1, m_otherTableWithoutIndexReplica->activeTupleCount());
-
-    beginTxn(100, 100, 99, 71);
-    deleteTuple(m_table, first_tuple);
-    temp_tuple = m_otherTableWithIndex->tempTuple();
-    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(4));
-    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(5));
-    TableTuple fifth_tuple = insertTuple(m_otherTableWithIndex, temp_tuple);
-    deleteTuple(m_otherTableWithIndex, third_tuple);
-    deleteTuple(m_table, second_tuple);
-    deleteTuple(m_otherTableWithoutIndex, fourth_tuple);
-    endTxn(true);
-
-    flushAndApply(100);
-
-    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
-    EXPECT_EQ(1, m_otherTableWithIndexReplica->activeTupleCount());
-    TableTuple tuple = m_otherTableWithIndexReplica->lookupTupleByValues(fifth_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-    EXPECT_EQ(0, m_otherTableWithoutIndexReplica->activeTupleCount());
-}
-
-TEST_F(DRBinaryLogTest, DeleteWithUniqueIndexNoninlineVarchar) {
-    vector<int> columnIndices;
-    columnIndices.push_back(0); // TINYINT
-    columnIndices.push_back(4); // non-inline VARCHAR
-    TableIndexScheme scheme = TableIndexScheme("the_index", HASH_TABLE_INDEX,
-                                               columnIndices, TableIndex::simplyIndexColumns(),
-                                               true, true, m_schema);
-    TableIndex *index = TableIndexFactory::getInstance(scheme);
-    scheme = TableIndexScheme("the_index", HASH_TABLE_INDEX,
-                              columnIndices, TableIndex::simplyIndexColumns(),
-                              true, true, m_schemaReplica);
-    TableIndex *replicaIndex = TableIndexFactory::getInstance(scheme);
-
-    m_table->addIndex(index);
-    m_tableReplica->addIndex(replicaIndex);
-
-    simpleDeleteTest();
-}
-
-TEST_F(DRBinaryLogTest, BasicUpdate) {
-    simpleUpdateTest();
-}
-
-TEST_F(DRBinaryLogTest, UpdateWithUniqueIndex) {
-    createIndexes();
-    std::pair<const TableIndex*, uint32_t> indexPair = m_table->getSmallestUniqueIndex();
-    std::pair<const TableIndex*, uint32_t> indexPairReplica = m_tableReplica->getSmallestUniqueIndex();
-    ASSERT_FALSE(indexPair.first == NULL);
-    ASSERT_FALSE(indexPairReplica.first == NULL);
-    EXPECT_EQ(indexPair.second, indexPairReplica.second);
-    simpleUpdateTest();
-}
+//TEST_F(DRBinaryLogTest, VerifyHiddenColumns) {
+//    ASSERT_FALSE(flush(98));
+//
+//    // single row write transaction
+//    beginTxn(99, 99, 98, 70);
+//    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+//    endTxn(true);
+//
+//    flushAndApply(99);
+//
+//    TableTuple tuple = m_tableReplica->lookupTupleByValues(first_tuple);
+//    NValue drTimestamp = tuple.getHiddenNValue(m_table->getDRTimestampColumnIndex());
+//    NValue drTimestampReplica = tuple.getHiddenNValue(m_tableReplica->getDRTimestampColumnIndex());
+//    EXPECT_EQ(ValuePeeker::peekAsBigInt(drTimestamp), 70);
+//    EXPECT_EQ(0, drTimestamp.compare(drTimestampReplica));
+//}
+//
+//TEST_F(DRBinaryLogTest, PartitionedTableNoRollbacks) {
+//    ASSERT_FALSE(flush(98));
+//
+//    // single row write transaction
+//    beginTxn(99, 99, 98, 70);
+//    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+//    endTxn(true);
+//
+//    // single row write transaction
+//    beginTxn(100, 100, 99, 71);
+//    TableTuple second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
+//    endTxn(true);
+//
+//    flushAndApply(100);
+//
+//    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
+//    TableTuple tuple = m_tableReplica->lookupTupleByValues(first_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//    tuple = m_tableReplica->lookupTupleByValues(second_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//
+//    // multiple row, multipart write transaction
+//    beginTxn(111, 101, 100, 72);
+//    first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
+//
+//    // Tick during an ongoing txn -- should not push out a buffer
+//    ASSERT_FALSE(flush(100));
+//
+//    second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 7, 234, "23452436.54", "what", "this is starting to get silly", 2342));
+//    endTxn(true);
+//
+//    // delete the second row inserted in the last write
+//    beginTxn(112, 102, 101, 73);
+//    deleteTuple(m_table, second_tuple);
+//    // Tick before the delete
+//    ASSERT_TRUE(flush(101));
+//    endTxn(true);
+//    // Apply the binary log after endTxn() to get a valid undoToken.
+//    flushAndApply(101);
+//
+//    EXPECT_EQ(4, m_tableReplica->activeTupleCount());
+//    tuple = m_tableReplica->lookupTupleByValues(first_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//    tuple = m_tableReplica->lookupTupleByValues(prepareTempTuple(m_table, 7, 234, "23452436.54", "what", "this is starting to get silly", 2342));
+//    ASSERT_FALSE(tuple.isNullTuple());
+//
+//    // Propagate the delete
+//    flushAndApply(102);
+//    EXPECT_EQ(3, m_tableReplica->activeTupleCount());
+//    tuple = m_tableReplica->lookupTupleByValues(first_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//    tuple = m_tableReplica->lookupTupleByValues(second_tuple);
+//    ASSERT_TRUE(tuple.isNullTuple());
+//
+//    EXPECT_EQ(3, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
+//    EXPECT_EQ(-1, m_drReplicatedStream.getLastCommittedSequenceNumberAndUniqueId().first);
+//}
+//
+//TEST_F(DRBinaryLogTest, PartitionedTableRollbacks) {
+//    m_singleColumnTable->setDR(false);
+//
+//    beginTxn(99, 99, 98, 70);
+//    TableTuple source_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+//    endTxn(false);
+//
+//    // Intentionally ignore the fact that a rollback wouldn't have actually advanced the
+//    // lastCommittedSpHandle. Our goal is to tick such that, if data had been produced,
+//    // it would flush itself out now
+//    ASSERT_FALSE(flush(99));
+//
+//    EXPECT_EQ(-1, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
+//    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
+//
+//    beginTxn(100, 100, 99, 71);
+//    source_tuple = insertTuple(m_table, prepareTempTuple(m_table, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
+//    endTxn(true);
+//
+//    // Roll back a txn that hasn't applied any binary log data
+//    beginTxn(101, 101, 100, 72);
+//    TableTuple temp_tuple = m_singleColumnTable->tempTuple();
+//    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(1));
+//    insertTuple(m_singleColumnTable, temp_tuple);
+//    endTxn(false);
+//
+//    flushAndApply(101);
+//
+//    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
+//    TableTuple tuple = m_tableReplica->lookupTupleByValues(source_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//
+//    EXPECT_EQ(0, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
+//}
+//
+//TEST_F(DRBinaryLogTest, ReplicatedTableWrites) {
+//    // write to only the replicated table
+//    beginTxn(109, 99, 98, 70);
+//    TableTuple first_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+//    endTxn(true);
+//
+//    flushAndApply(99);
+//
+//    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
+//    EXPECT_EQ(1, m_replicatedTableReplica->activeTupleCount());
+//    TableTuple tuple = m_replicatedTableReplica->lookupTupleByValues(first_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//
+//    // write to both the partitioned and replicated table
+//    beginTxn(110, 100, 99, 71);
+//    first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
+//    TableTuple second_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 7, 234, "23452436.54", "what", "this is starting to get silly", 2342));
+//    endTxn(true);
+//
+//    flushAndApply(100);
+//
+//    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
+//    EXPECT_EQ(2, m_replicatedTableReplica->activeTupleCount());
+//    tuple = m_tableReplica->lookupTupleByValues(first_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//    tuple = m_replicatedTableReplica->lookupTupleByValues(second_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//
+//    // write to the partitioned and replicated table and roll it back
+//    beginTxn(111, 101, 100, 72);
+//    first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 11, 34534, "3453.4545", "another", "blah blah blah blah blah blah", 2344));
+//    second_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
+//    endTxn(false);
+//
+//    ASSERT_FALSE(flush(101));
+//
+//    // one more write to the replicated table for good measure
+//    beginTxn(112, 102, 101, 73);
+//    second_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
+//    endTxn(true);
+//
+//    flushAndApply(102);
+//    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
+//    EXPECT_EQ(3, m_replicatedTableReplica->activeTupleCount());
+//    tuple = m_replicatedTableReplica->lookupTupleByValues(second_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//
+//    EXPECT_EQ(0, m_drStream.getLastCommittedSequenceNumberAndUniqueId().first);
+//    EXPECT_EQ(2, m_drReplicatedStream.getLastCommittedSequenceNumberAndUniqueId().first);
+//}
+//
+//TEST_F(DRBinaryLogTest, SerializeNulls) {
+//    beginTxn(109, 99, 98, 70);
+//    TableTuple temp_tuple = m_replicatedTable->tempTuple();
+//    temp_tuple.setNValue(0, NValue::getNullValue(VALUE_TYPE_TINYINT));
+//    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(489735));
+//    temp_tuple.setNValue(2, NValue::getNullValue(VALUE_TYPE_DECIMAL));
+//    m_cachedStringValues.push_back(ValueFactory::getStringValue("whatever"));
+//    temp_tuple.setNValue(3, m_cachedStringValues.back());
+//    temp_tuple.setNValue(4, ValueFactory::getNullStringValue());
+//    temp_tuple.setNValue(5, ValueFactory::getTimestampValue(3495));
+//    TableTuple first_tuple = insertTuple(m_replicatedTable, temp_tuple);
+//
+//    temp_tuple = m_replicatedTable->tempTuple();
+//    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(42));
+//    temp_tuple.setNValue(1, NValue::getNullValue(VALUE_TYPE_BIGINT));
+//    temp_tuple.setNValue(2, ValueFactory::getDecimalValueFromString("234234.243"));
+//    temp_tuple.setNValue(3, ValueFactory::getNullStringValue());
+//    m_cachedStringValues.push_back(ValueFactory::getStringValue("whatever and ever and ever and ever"));
+//    temp_tuple.setNValue(4, m_cachedStringValues.back());
+//    temp_tuple.setNValue(5, NValue::getNullValue(VALUE_TYPE_TIMESTAMP));
+//    TableTuple second_tuple = insertTuple(m_replicatedTable, temp_tuple);
+//    endTxn(true);
+//
+//    flushAndApply(99);
+//
+//    EXPECT_EQ(2, m_replicatedTableReplica->activeTupleCount());
+//    TableTuple tuple = m_replicatedTableReplica->lookupTupleByValues(first_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//    tuple = m_replicatedTableReplica->lookupTupleByValues(second_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//}
+//
+//TEST_F(DRBinaryLogTest, RollbackNulls) {
+//    beginTxn(109, 99, 98, 70);
+//    TableTuple temp_tuple = m_replicatedTable->tempTuple();
+//    temp_tuple.setNValue(0, NValue::getNullValue(VALUE_TYPE_TINYINT));
+//    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(489735));
+//    temp_tuple.setNValue(2, NValue::getNullValue(VALUE_TYPE_DECIMAL));
+//    m_cachedStringValues.push_back(ValueFactory::getStringValue("whatever"));
+//    temp_tuple.setNValue(3, m_cachedStringValues.back());
+//    temp_tuple.setNValue(4, ValueFactory::getNullStringValue());
+//    temp_tuple.setNValue(5, ValueFactory::getTimestampValue(3495));
+//    insertTuple(m_replicatedTable, temp_tuple);
+//    endTxn(false);
+//
+//    beginTxn(110, 100, 99, 71);
+//    TableTuple source_tuple = insertTuple(m_replicatedTable, prepareTempTuple(m_replicatedTable, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
+//    endTxn(true);
+//
+//    flushAndApply(100);
+//
+//    EXPECT_EQ(1, m_replicatedTableReplica->activeTupleCount());
+//    TableTuple tuple = m_replicatedTableReplica->lookupTupleByValues(source_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//}
+//
+//TEST_F(DRBinaryLogTest, RollbackOnReplica) {
+//    // single row write transaction
+//    beginTxn(99, 99, 98, 70);
+//    insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+//    endTxn(true);
+//
+//    // try and fail to apply this on the replica
+//    flushAndApply(99, false);
+//
+//    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
+//
+//    // successfully apply some data for, I don't know, verisimilitude?
+//    beginTxn(100, 100, 99, 71);
+//    TableTuple source_tuple = insertTuple(m_table, prepareTempTuple(m_table, 99, 29058, "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
+//    endTxn(true);
+//
+//    flushAndApply(100);
+//
+//    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
+//    TableTuple tuple = m_tableReplica->lookupTupleByValues(source_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//
+//    // inserts followed by some deletes
+//    beginTxn(101, 101, 100, 72);
+//    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 11, 34534, "3453.4545", "another", "blah blah blah blah blah blah", 2344));
+//    TableTuple second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
+//    insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
+//    deleteTuple(m_table, first_tuple);
+//    deleteTuple(m_table, second_tuple);
+//    endTxn(true);
+//
+//    flushAndApply(101, false);
+//
+//    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
+//    tuple = m_tableReplica->lookupTupleByValues(source_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//}
+//
+//TEST_F(DRBinaryLogTest, CantFindTable) {
+//    beginTxn(99, 99, 98, 70);
+//    TableTuple temp_tuple = m_singleColumnTable->tempTuple();
+//    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(1));
+//    insertTuple(m_singleColumnTable, temp_tuple);
+//    endTxn(true);
+//
+//    // try and fail to apply this on the replica because the table cannot be found.
+//    // should not throw fatal exception.
+//    try {
+//        flushAndApply(99, false);
+//    } catch (SerializableEEException &e) {
+//        endTxn(false);
+//    } catch (...) {
+//        ASSERT_TRUE(false);
+//    }
+//}
+//
+//TEST_F(DRBinaryLogTest, DeleteWithUniqueIndex) {
+//    createIndexes();
+//    simpleDeleteTest();
+//}
+//
+//TEST_F(DRBinaryLogTest, DeleteWithUniqueIndexMultipleTables) {
+//    createIndexes();
+//
+//    std::pair<const TableIndex*, uint32_t> indexPair1 = m_otherTableWithIndex->getSmallestUniqueIndex();
+//    std::pair<const TableIndex*, uint32_t> indexPair2 = m_otherTableWithoutIndex->getSmallestUniqueIndex();
+//    ASSERT_FALSE(indexPair1.first == NULL);
+//    ASSERT_TRUE(indexPair2.first == NULL);
+//
+//    beginTxn(99, 99, 98, 70);
+//    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+//    TableTuple second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
+//    TableTuple temp_tuple = m_otherTableWithIndex->tempTuple();
+//    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(0));
+//    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(1));
+//    TableTuple third_tuple = insertTuple(m_otherTableWithIndex, temp_tuple);
+//    temp_tuple = m_otherTableWithoutIndex->tempTuple();
+//    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(2));
+//    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(3));
+//    TableTuple fourth_tuple = insertTuple(m_otherTableWithoutIndex, temp_tuple);
+//    endTxn(true);
+//
+//    flushAndApply(99);
+//
+//    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
+//    EXPECT_EQ(1, m_otherTableWithIndexReplica->activeTupleCount());
+//    EXPECT_EQ(1, m_otherTableWithoutIndexReplica->activeTupleCount());
+//
+//    beginTxn(100, 100, 99, 71);
+//    deleteTuple(m_table, first_tuple);
+//    temp_tuple = m_otherTableWithIndex->tempTuple();
+//    temp_tuple.setNValue(0, ValueFactory::getTinyIntValue(4));
+//    temp_tuple.setNValue(1, ValueFactory::getBigIntValue(5));
+//    TableTuple fifth_tuple = insertTuple(m_otherTableWithIndex, temp_tuple);
+//    deleteTuple(m_otherTableWithIndex, third_tuple);
+//    deleteTuple(m_table, second_tuple);
+//    deleteTuple(m_otherTableWithoutIndex, fourth_tuple);
+//    endTxn(true);
+//
+//    flushAndApply(100);
+//
+//    EXPECT_EQ(0, m_tableReplica->activeTupleCount());
+//    EXPECT_EQ(1, m_otherTableWithIndexReplica->activeTupleCount());
+//    TableTuple tuple = m_otherTableWithIndexReplica->lookupTupleByValues(fifth_tuple);
+//    ASSERT_FALSE(tuple.isNullTuple());
+//    EXPECT_EQ(0, m_otherTableWithoutIndexReplica->activeTupleCount());
+//}
+//
+//TEST_F(DRBinaryLogTest, DeleteWithUniqueIndexNoninlineVarchar) {
+//    vector<int> columnIndices;
+//    columnIndices.push_back(0); // TINYINT
+//    columnIndices.push_back(4); // non-inline VARCHAR
+//    TableIndexScheme scheme = TableIndexScheme("the_index", HASH_TABLE_INDEX,
+//                                               columnIndices, TableIndex::simplyIndexColumns(),
+//                                               true, true, m_schema);
+//    TableIndex *index = TableIndexFactory::getInstance(scheme);
+//    scheme = TableIndexScheme("the_index", HASH_TABLE_INDEX,
+//                              columnIndices, TableIndex::simplyIndexColumns(),
+//                              true, true, m_schemaReplica);
+//    TableIndex *replicaIndex = TableIndexFactory::getInstance(scheme);
+//
+//    m_table->addIndex(index);
+//    m_tableReplica->addIndex(replicaIndex);
+//
+//    simpleDeleteTest();
+//}
+//
+//TEST_F(DRBinaryLogTest, BasicUpdate) {
+//    simpleUpdateTest();
+//}
+//
+//TEST_F(DRBinaryLogTest, UpdateWithUniqueIndex) {
+//    createIndexes();
+//    std::pair<const TableIndex*, uint32_t> indexPair = m_table->getSmallestUniqueIndex();
+//    std::pair<const TableIndex*, uint32_t> indexPairReplica = m_tableReplica->getSmallestUniqueIndex();
+//    ASSERT_FALSE(indexPair.first == NULL);
+//    ASSERT_FALSE(indexPairReplica.first == NULL);
+//    EXPECT_EQ(indexPair.second, indexPairReplica.second);
+//    simpleUpdateTest();
+//}
 
 /*
- * Conflict detection test case - Unique Constraint Violation
- * Operations like insert/insert, insert/update and update/update.
+ * Conflict detection test case - Insert Unique Constraint Violation
+ * Operations like insert/insert, insert/update.
  */
-TEST_F(DRBinaryLogTest, DetectUniqueConstraintViolation) {
-    createPrimaryKey();
+TEST_F(DRBinaryLogTest, DetectInsertUniqueConstraintViolation) {
+    createPrimaryKey(m_table, 1);
+    createPrimaryKey(m_tableReplica, 1);
     ASSERT_FALSE(flush(98));
 
-    // single row write transaction
+    // single row write transaction on replica
     beginTxn(99, 99, 98, 70);
-    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555,
+    insertTuple(m_tableReplica, prepareTempTuple(m_tableReplica, 42, 55555,
             "349508345.34583", "a thing", "a totally different thing altogether", 5433));
     endTxn(true);
+    flushButDontApply(99);
 
-    // insert the same row again
+    // insert the same row again on both side
     beginTxn(100, 100, 99, 71);
-    TableTuple second_tuple = insertTuple(m_table, prepareTempTuple(m_table, 99, 55555/*causes a constraint violation*/,
+    insertTuple(m_table, prepareTempTuple(m_table, 99, 55555/*causes a constraint violation*/,
             "92384598.2342", "what", "really, why am I writing anything in these?", 3455));
     endTxn(true);
 
-    flushAndApply(100);
-
-    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
-    TableTuple tuple = m_tableReplica->lookupTupleByValues(first_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
-    tuple = m_tableReplica->lookupTupleByValues(second_tuple);
-    ASSERT_FALSE(tuple.isNullTuple());
+    flushAndApply(100, true/*success*/, true/*isActiveActiveDREnabled*/);
 }
 
 /*
- * Conflict detection test case - Missing Tuple
- * Operations like update/update, update/delete, delete/delete
+ * Conflict detection test case - Update Unique Constraint Violation
+ * Operations like update/update, update/insert.
  */
-TEST_F(DRBinaryLogTest, DetectMissingTuple) {
+TEST_F(DRBinaryLogTest, DetectUpdateUniqueConstraintViolation) {
+    createPrimaryKey(m_table, 0);
+    createPrimaryKey(m_tableReplica, 0);
+    ASSERT_FALSE(flush(98));
+
+    // insert row on both side
+    beginTxn(99, 99, 98, 70);
+    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 24,
+            2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
+    endTxn(true);
+    flushAndApply(99);
+
+    EXPECT_EQ(1, m_table->activeTupleCount());
+    EXPECT_EQ(1, m_tableReplica->activeTupleCount());
+
+    // insert new row on replica side
+    beginTxn(100, 100, 99, 71);
+    insertTuple(m_tableReplica, prepareTempTuple(m_tableReplica, 42, 55555, "349508345.34583", "a thing",
+            "a totally different thing altogether", 5433));
+    endTxn(true);
+    flushButDontApply(100);
+
+    EXPECT_EQ(1, m_table->activeTupleCount());
+    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
+
+    // update row on master to create a conflict
+    beginTxn(101, 101, 100, 72);
+    // update the non-index column only
+    updateTuple(m_table, first_tuple, 42/*causes a constraint violation*/, "not that");
+    endTxn(true);
+    flushAndApply(101, true/*success*/, true/*isActiveActiveDREnabled*/);
+
+    EXPECT_EQ(1, m_table->activeTupleCount());
+    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
+}
+
+/*
+ * Conflict detection test case - Delete Missing Tuple
+ * Operations like delete/update, delete/delete
+ */
+TEST_F(DRBinaryLogTest, DetectDeleteMissingTuple) {
+    // insert rows on both side
+    beginTxn(99, 99, 98, 70);
+    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+    insertTuple(m_table, prepareTempTuple(m_table, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
+    insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
+    endTxn(true);
+    flushAndApply(99);
+
+    EXPECT_EQ(3, m_tableReplica->activeTupleCount());
+
+    // delete row on replica
+    beginTxn(100, 100, 99, 71);
+    deleteTuple(m_tableReplica, first_tuple);
+    endTxn(true);
+    flushButDontApply(100);
+
+    EXPECT_EQ(3, m_table->activeTupleCount());
+    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
+
+    // delete the same row on master then wait to trigger conflict on replica
+    beginTxn(101, 101, 100, 72);
+    deleteTuple(m_table, first_tuple);
+    endTxn(true);
+    flushAndApply(101, true/*success*/, true/*isActiveActiveDREnabled*/);
+
+    EXPECT_EQ(2, m_tableReplica->activeTupleCount());
+}
+
+/*
+ * Conflict detection test case - Update Missing Tuple
+ * Operations like update/update, update/delete
+ */
+TEST_F(DRBinaryLogTest, DetectUpdateMissingTuple) {
+    // insert rows on both side
+    beginTxn(99, 99, 98, 70);
+    TableTuple first_tuple = insertTuple(m_table, prepareTempTuple(m_table, 42, 55555, "349508345.34583", "a thing", "a totally different thing altogether", 5433));
+    insertTuple(m_table, prepareTempTuple(m_table, 24, 2321, "23455.5554", "and another", "this is starting to get even sillier", 2222));
+    insertTuple(m_table, prepareTempTuple(m_table, 72, 345, "4256.345", "something", "more tuple data, really not the same", 1812));
+    endTxn(true);
+    flushAndApply(99);
+
+    EXPECT_EQ(3, m_tableReplica->activeTupleCount());
+
+    // update one row on replica
+    beginTxn(100, 100, 99, 71);
+    updateTuple(m_tableReplica, first_tuple, 42/*causes a constraint violation*/, "not that");
+    endTxn(true);
+    flushButDontApply(100);
+
+    // update the same row on master then wait to trigger conflict on replica
+    beginTxn(101, 101, 100, 72);
+    updateTuple(m_table, first_tuple, 42/*causes a constraint violation*/, "not that");
+    endTxn(true);
+    flushAndApply(101, true/*success*/, true/*isActiveActiveDREnabled*/);
 
 }
 
